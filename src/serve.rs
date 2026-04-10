@@ -7,6 +7,29 @@ use std::sync::Arc;
 
 use crate::ServerArgs;
 
+/// Rotate the log file if it exceeds `max_size` bytes.
+/// Renames `path` to `path.old` (overwriting any previous `.old`),
+/// so at most 1 old copy is kept.
+fn rotate_if_needed(path: &std::path::Path, max_size: u64) {
+    let meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(_) => return,
+    };
+    if meta.len() <= max_size {
+        return;
+    }
+    let mut old = path.to_path_buf();
+    let mut name = old
+        .file_name()
+        .unwrap_or_default()
+        .to_os_string();
+    name.push(".old");
+    old.set_file_name(name);
+    // Remove previous .old, rename current, ignore errors.
+    let _ = std::fs::remove_file(&old);
+    let _ = std::fs::rename(path, &old);
+}
+
 pub async fn cmd_serve(args: ServerArgs) -> Result<()> {
     let ServerArgs {
         config: config_path,
@@ -37,6 +60,15 @@ pub async fn cmd_serve(args: ServerArgs) -> Result<()> {
     };
 
     let snapshot = config_arc.load();
+
+    // ── Log rotation ────────────────────────────────────────────────────
+    // Rotate the default daemon log file on startup if it exceeds max_size.
+    // In daemon mode stdout/stderr are redirected to this file, so the
+    // tracing appender never manages it.
+    let max_log_size = snapshot.log.max_size;
+    if let Ok(default_log) = byokey_daemon::paths::log_path() {
+        rotate_if_needed(&default_log, max_log_size);
+    }
 
     // Initialize structured logging based on config.
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
@@ -116,6 +148,19 @@ pub async fn cmd_serve(args: ServerArgs) -> Result<()> {
         }
     }
     let app = byokey_proxy::make_router(state);
+
+    // ── Periodic log rotation ───────────────────────────────────────────
+    // Check every 10 minutes and rotate if the daemon log exceeds max_size.
+    if let Ok(default_log) = byokey_daemon::paths::log_path() {
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(600));
+            interval.tick().await; // skip immediate first tick
+            loop {
+                interval.tick().await;
+                rotate_if_needed(&default_log, max_log_size);
+            }
+        });
+    }
 
     // Check for TLS configuration.
     let tls_config = snapshot.tls.as_ref().filter(|t| t.enable);
