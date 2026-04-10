@@ -9,6 +9,7 @@
 //! - [`usage`]    — In-memory request/token usage tracking.
 
 pub mod error;
+pub mod gcp_auth;
 pub mod handler;
 #[allow(clippy::needless_for_each)]
 pub mod openapi;
@@ -16,6 +17,7 @@ pub mod router;
 pub mod usage;
 
 pub use error::ApiError;
+pub use gcp_auth::GcpTokenManager;
 pub use handler::amp_threads::AmpThreadIndex;
 pub use openapi::ApiDoc;
 pub use router::make_router;
@@ -46,6 +48,8 @@ pub struct AppState {
     pub amp_quota: Arc<AmpQuotaStore>,
     /// Pre-built, file-watched index of local Amp CLI thread summaries.
     pub amp_threads: Arc<AmpThreadIndex>,
+    /// GCP token manager for Vertex AI backends.
+    pub gcp_tokens: Arc<GcpTokenManager>,
 }
 
 impl AppState {
@@ -83,6 +87,7 @@ impl AppState {
             device_profiles: Arc::new(DeviceProfileCache::new()),
             amp_quota: Arc::new(AmpQuotaStore::new()),
             amp_threads,
+            gcp_tokens: Arc::new(GcpTokenManager::new()),
         })
     }
 }

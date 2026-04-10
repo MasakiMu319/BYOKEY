@@ -17,6 +17,7 @@ pub enum ProviderId {
     Kimi,
     IFlow,
     Amp,
+    VertexAi,
 }
 
 impl fmt::Display for ProviderId {
@@ -32,6 +33,7 @@ impl fmt::Display for ProviderId {
             Self::Kimi => write!(f, "kimi"),
             Self::IFlow => write!(f, "iflow"),
             Self::Amp => write!(f, "amp"),
+            Self::VertexAi => write!(f, "vertex_ai"),
         }
     }
 }
@@ -57,6 +59,7 @@ impl std::str::FromStr for ProviderId {
             "kimi" | "moonshot" => Ok(Self::Kimi),
             "iflow" | "zai" | "glm" => Ok(Self::IFlow),
             "amp" | "ampcode" => Ok(Self::Amp),
+            "vertex_ai" | "vertexai" | "vertex" => Ok(Self::VertexAi),
             other => Err(crate::ByokError::UnsupportedProvider(other.to_string())),
         }
     }
@@ -77,6 +80,7 @@ impl ProviderId {
             Self::Kimi => "Kimi (Moonshot)",
             Self::IFlow => "iFlow (Z.ai)",
             Self::Amp => "Amp (AmpCode)",
+            Self::VertexAi => "Vertex AI (Google Cloud)",
         }
     }
 
@@ -94,6 +98,7 @@ impl ProviderId {
             Self::Kimi,
             Self::IFlow,
             Self::Amp,
+            Self::VertexAi,
         ]
     }
 }
@@ -126,6 +131,7 @@ mod tests {
         assert_eq!(ProviderId::Kimi.to_string(), "kimi");
         assert_eq!(ProviderId::IFlow.to_string(), "iflow");
         assert_eq!(ProviderId::Amp.to_string(), "amp");
+        assert_eq!(ProviderId::VertexAi.to_string(), "vertex_ai");
     }
 
     #[test]
@@ -146,6 +152,10 @@ mod tests {
         assert_eq!(ProviderId::from_str("kimi").unwrap(), ProviderId::Kimi);
         assert_eq!(ProviderId::from_str("iflow").unwrap(), ProviderId::IFlow);
         assert_eq!(ProviderId::from_str("amp").unwrap(), ProviderId::Amp);
+        assert_eq!(
+            ProviderId::from_str("vertex_ai").unwrap(),
+            ProviderId::VertexAi
+        );
     }
 
     #[test]
@@ -162,6 +172,14 @@ mod tests {
         assert_eq!(ProviderId::from_str("zai").unwrap(), ProviderId::IFlow);
         assert_eq!(ProviderId::from_str("glm").unwrap(), ProviderId::IFlow);
         assert_eq!(ProviderId::from_str("ampcode").unwrap(), ProviderId::Amp);
+        assert_eq!(
+            ProviderId::from_str("vertexai").unwrap(),
+            ProviderId::VertexAi
+        );
+        assert_eq!(
+            ProviderId::from_str("vertex").unwrap(),
+            ProviderId::VertexAi
+        );
     }
 
     #[test]
@@ -184,6 +202,7 @@ mod tests {
             ProviderId::Kimi,
             ProviderId::IFlow,
             ProviderId::Amp,
+            ProviderId::VertexAi,
         ] {
             let json = serde_json::to_string(&p).unwrap();
             let back: ProviderId = serde_json::from_str(&json).unwrap();

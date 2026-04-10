@@ -155,7 +155,7 @@ pub fn make_executor_with_cache(
                 .maybe_ratelimit(ratelimit)
                 .build(),
         )),
-        ProviderId::Amp => None, // Amp is not a model provider
+        ProviderId::Amp | ProviderId::VertexAi => None, // handled at handler layer
     }
 }
 

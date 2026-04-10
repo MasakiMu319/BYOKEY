@@ -40,6 +40,9 @@ pub async fn login(provider: &ProviderId, auth: &AuthManager, account: Option<&s
         ProviderId::Kiro => Err(ByokError::Auth(
             "Kiro OAuth login not yet implemented".into(),
         )),
+        ProviderId::VertexAi => Err(ByokError::Auth(
+            "Vertex AI uses GCP service account credentials, not OAuth login".into(),
+        )),
     }
 }
 

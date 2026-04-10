@@ -162,6 +162,17 @@ async fn chat_completions_inner(
         Some(pc)
     };
 
+    // Check for Vertex AI backend override before entering the generic factory.
+    if let Some(ref pid) = provider_hint
+        .clone()
+        .or_else(|| byokey_provider::resolve_provider(&suffix.model))
+    {
+        let pc = config.providers.get(pid).cloned().unwrap_or_default();
+        if pc.backend.as_ref() == Some(&ProviderId::VertexAi) {
+            return vertex_ai_chat(&state, request, &suffix, pid, &config).await;
+        }
+    }
+
     let executor = make_executor_for_model(
         &suffix.model,
         config_fn,
@@ -242,5 +253,120 @@ async fn chat_completions_inner(
             state.usage.record_failure(&model_name, &provider);
             Err(ApiError::from(e))
         }
+    }
+}
+
+/// Build the Vertex AI host from a region string.
+fn vertex_ai_host(region: &str) -> String {
+    if region == "global" {
+        "aiplatform.googleapis.com".to_owned()
+    } else {
+        format!("{region}-aiplatform.googleapis.com")
+    }
+}
+
+/// Route OpenAI-compatible chat requests through Vertex AI.
+///
+/// Currently supports Gemini models via the OpenAI-compatible endpoint:
+/// `.../endpoints/openapi/chat/completions`
+async fn vertex_ai_chat(
+    state: &Arc<AppState>,
+    request: ChatRequest,
+    suffix: &byokey_translate::ModelSuffix,
+    original_provider: &ProviderId,
+    config: &byokey_config::Config,
+) -> Result<Response, ApiError> {
+    use byokey_types::ByokError;
+
+    let vertex = match original_provider {
+        ProviderId::Gemini => &config.vertex_ai.gemini,
+        ProviderId::Claude => &config.vertex_ai.claude,
+        _ => {
+            return Err(ApiError::from(ByokError::Config(format!(
+                "Vertex AI backend not supported for provider {original_provider}"
+            ))));
+        }
+    };
+    let project_id = vertex.project_id.as_deref().ok_or_else(|| {
+        ApiError::from(ByokError::Config(format!(
+            "vertex_ai.{original_provider}.project_id is required"
+        )))
+    })?;
+
+    let host = vertex_ai_host(&vertex.region);
+    let url = format!(
+        "https://{host}/v1beta1/projects/{project_id}/locations/{region}/endpoints/openapi/chat/completions",
+        region = vertex.region,
+    );
+
+    let token = state
+        .gcp_tokens
+        .get_token(vertex.credentials_file.as_deref())
+        .await
+        .map_err(ApiError::from)?;
+
+    let model_name = suffix.model.clone();
+    let stream = request.stream;
+    let mut body = request.into_body();
+    body["stream"] = serde_json::Value::Bool(stream);
+
+    tracing::info!(
+        %url, model = %model_name, stream,
+        "routing chat completion through Vertex AI"
+    );
+
+    let resp = state
+        .http
+        .post(&url)
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| ApiError(ByokError::from(e)))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        state.usage.record_failure(&model_name, "vertex_ai");
+        return Err(ApiError::from(ByokError::Upstream {
+            status: status.as_u16(),
+            body: text,
+            retry_after: None,
+        }));
+    }
+
+    let provider_label = "vertex_ai";
+
+    if stream {
+        let byte_stream: byokey_types::traits::ByteStream = Box::pin(
+            resp.bytes_stream()
+                .map_err(|e| byokey_types::ByokError::Http(e.to_string())),
+        );
+        let tapped = tap_stream_usage(
+            byte_stream,
+            state.usage.clone(),
+            model_name,
+            provider_label.to_owned(),
+        );
+        let mapped = tapped.map_err(|e| std::io::Error::other(e.to_string()));
+        let body = Body::from_stream(mapped);
+        Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "text/event-stream")
+            .header("cache-control", "no-cache")
+            .header("x-accel-buffering", "no")
+            .body(body)
+            .expect("valid response"))
+    } else {
+        let json: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| ApiError(ByokError::Http(e.to_string())))?;
+        let (input_tok, output_tok) = extract_usage_tokens(&json);
+        state
+            .usage
+            .record_success(&model_name, provider_label, input_tok, output_tok);
+        Ok(Json(json).into_response())
     }
 }

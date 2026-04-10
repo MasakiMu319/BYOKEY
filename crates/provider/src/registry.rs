@@ -563,8 +563,8 @@ mod tests {
     #[test]
     fn test_model_lists_non_empty() {
         for provider in ProviderId::all() {
-            if *provider == ProviderId::Amp {
-                continue; // Amp is not a model provider
+            if *provider == ProviderId::Amp || *provider == ProviderId::VertexAi {
+                continue; // not model-owning providers
             }
             let models = models_for_provider(provider);
             assert!(

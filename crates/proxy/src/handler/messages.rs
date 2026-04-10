@@ -1,12 +1,13 @@
 //! Anthropic Messages API passthrough handler.
 //!
 //! Accepts requests in native Anthropic format and forwards them to
-//! either `api.anthropic.com/v1/messages` (default) or
-//! `api.githubcopilot.com/v1/messages` (Copilot backend).
+//! either `api.anthropic.com/v1/messages` (default),
+//! `api.githubcopilot.com/v1/messages` (Copilot backend), or
+//! Google Cloud Vertex AI (Vertex AI backend).
 //!
-//! Copilot routing is triggered by:
-//! 1. `POST /copilot/v1/messages` — dedicated route, always goes through Copilot.
-//! 2. `claude.backend: copilot` config — global override on `/v1/messages`.
+//! Backend routing is triggered by `claude.backend` config:
+//! - `copilot` → GitHub Copilot (also via `POST /copilot/v1/messages`)
+//! - `vertex_ai` → Google Cloud Vertex AI `:rawPredict` / `:streamRawPredict`
 //!
 //! The response (streaming SSE or complete JSON) is returned as-is.
 
@@ -252,6 +253,10 @@ pub async fn anthropic_messages(
 
     if claude_config.backend.as_ref() == Some(&ProviderId::Copilot) {
         return copilot_messages(&state, body, stream, &beta).await;
+    }
+
+    if claude_config.backend.as_ref() == Some(&ProviderId::VertexAi) {
+        return vertex_ai_messages(&state, body, stream, &beta, &config).await;
     }
 
     // Default: passthrough to Anthropic API.
@@ -511,6 +516,87 @@ async fn copilot_messages(
     state.usage.record_failure(&model_name, "copilot");
     Err(last_err
         .unwrap_or_else(|| ApiError(ByokError::Auth("no copilot accounts available".into()))))
+}
+
+/// Build the Vertex AI host from a region string.
+///
+/// `"global"` → `aiplatform.googleapis.com`
+/// `"us-east5"` → `us-east5-aiplatform.googleapis.com`
+fn vertex_ai_host(region: &str) -> String {
+    if region == "global" {
+        "aiplatform.googleapis.com".to_owned()
+    } else {
+        format!("{region}-aiplatform.googleapis.com")
+    }
+}
+
+/// Route Anthropic-format request to Vertex AI Claude endpoint.
+///
+/// Vertex AI serves Claude via `:rawPredict` (non-streaming) or
+/// `:streamRawPredict` (streaming) at the publisher path
+/// `.../publishers/anthropic/models/{model}`.
+async fn vertex_ai_messages(
+    state: &Arc<AppState>,
+    body: Value,
+    stream: bool,
+    beta: &str,
+    config: &byokey_config::Config,
+) -> Result<Response, ApiError> {
+    let vertex = &config.vertex_ai.claude;
+    let project_id = vertex.project_id.as_deref().ok_or_else(|| {
+        ApiError(ByokError::Config(
+            "vertex_ai.claude.project_id is required".into(),
+        ))
+    })?;
+
+    let model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let model_name = model.to_string();
+
+    let host = vertex_ai_host(&vertex.region);
+    let method = if stream {
+        "streamRawPredict"
+    } else {
+        "rawPredict"
+    };
+    let url = format!(
+        "https://{host}/v1/projects/{project_id}/locations/{region}/publishers/anthropic/models/{model}:{method}",
+        region = vertex.region,
+    );
+
+    let token = state
+        .gcp_tokens
+        .get_token(vertex.credentials_file.as_deref())
+        .await
+        .map_err(ApiError::from)?;
+
+    let accept = if stream {
+        "text/event-stream"
+    } else {
+        "application/json"
+    };
+
+    tracing::info!(
+        %url, model = %model_name, stream,
+        "routing Anthropic messages through Vertex AI"
+    );
+
+    let resp = state
+        .http
+        .post(&url)
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .header("anthropic-version", ANTHROPIC_VERSION)
+        .header("anthropic-beta", beta)
+        .header("accept", accept)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| ApiError(ByokError::from(e)))?;
+
+    forward_response(resp, stream, &state.usage, &model_name, "vertex_ai").await
 }
 
 /// Extract token counts from an Anthropic non-streaming response.
