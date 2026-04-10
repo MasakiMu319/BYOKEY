@@ -624,6 +624,38 @@ pub async fn amp_management_proxy(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    // ── Local web tools interception ───────────────────────────────────
+    // Intercept webSearch2 / extractWebPageContent before forwarding upstream.
+    if path == "internal" {
+        if let Some(q) = query.as_deref() {
+            if q.contains("webSearch2") {
+                if let Some(resp_bytes) =
+                    super::web_tools::handle_web_search(&state, &body).await
+                {
+                    tracing::info!("webSearch2 handled locally (Kagi)");
+                    return (
+                        StatusCode::OK,
+                        [(axum::http::header::CONTENT_TYPE, "application/json")],
+                        resp_bytes,
+                    )
+                        .into_response();
+                }
+            } else if q.contains("extractWebPageContent") {
+                if let Some(resp_bytes) =
+                    super::web_tools::handle_extract_web_page(&state, &body).await
+                {
+                    tracing::info!("extractWebPageContent handled locally (agent-browser)");
+                    return (
+                        StatusCode::OK,
+                        [(axum::http::header::CONTENT_TYPE, "application/json")],
+                        resp_bytes,
+                    )
+                        .into_response();
+                }
+            }
+        }
+    }
+
     let url = match query.as_deref() {
         Some(q) if !q.is_empty() => format!("{AMP_BACKEND}/api/{path}?{q}"),
         _ => format!("{AMP_BACKEND}/api/{path}"),

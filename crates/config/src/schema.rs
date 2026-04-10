@@ -179,6 +179,20 @@ fn default_host() -> String {
     "127.0.0.1".to_string()
 }
 
+/// Configuration for local web search / web page extraction,
+/// used to intercept AmpCode's `webSearch2` and `extractWebPageContent`
+/// internal API calls and serve them locally instead of via ampcode.com.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WebToolsConfig {
+    /// Enable local web search (Kagi). Requires `kagi_search_cookie` and `kagi_session_cookie`.
+    pub enabled: bool,
+    /// Kagi `_kagi_search_` cookie value.
+    pub kagi_search_cookie: Option<String>,
+    /// Kagi `kagi_session` cookie value.
+    pub kagi_session_cookie: Option<String>,
+}
+
 /// `AmpCode` 管理代理配置。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AmpConfig {
@@ -192,6 +206,40 @@ pub struct AmpConfig {
     /// `isDailyGrantEnabled` 改为 `false`，隐藏免费层提示（默认关闭）。
     #[serde(default)]
     pub hide_free_tier: bool,
+    /// Local web tools configuration (search & page extraction).
+    #[serde(default)]
+    pub web_tools: WebToolsConfig,
+}
+
+fn default_vertex_region() -> String {
+    "global".to_string()
+}
+
+/// Per-provider Vertex AI endpoint configuration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VertexAiProviderConfig {
+    /// GCP project ID (e.g. "tap-agent-infra").
+    pub project_id: Option<String>,
+    /// GCP region (e.g. "us-east5", "global"). Defaults to "global".
+    #[serde(default = "default_vertex_region")]
+    pub region: String,
+    /// Path to GCP service account JSON key file.
+    /// If not set, falls back to `GOOGLE_APPLICATION_CREDENTIALS` env var (Claude)
+    /// or Application Default Credentials (Gemini).
+    pub credentials_file: Option<String>,
+}
+
+/// Google Cloud Vertex AI configuration for routing requests
+/// through Vertex AI endpoints. Each provider (claude, gemini) has its own
+/// project, region, and credentials settings.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VertexAiConfig {
+    /// Claude-specific Vertex AI settings.
+    pub claude: VertexAiProviderConfig,
+    /// Gemini-specific Vertex AI settings.
+    pub gemini: VertexAiProviderConfig,
 }
 
 /// A single model alias mapping.
@@ -221,6 +269,9 @@ pub struct Config {
     /// `AmpCode` 管理代理配置。
     #[serde(default)]
     pub amp: AmpConfig,
+    /// Google Cloud Vertex AI configuration.
+    #[serde(default)]
+    pub vertex_ai: VertexAiConfig,
     /// Global upstream proxy URL (e.g. "socks5://user:pass@host:port").
     /// All upstream requests will go through this proxy.
     #[serde(default)]
@@ -337,6 +388,15 @@ pub struct LogConfig {
     /// Log level override (default: "info"). Overridden by `RUST_LOG` env var.
     #[serde(default = "default_log_level")]
     pub level: String,
+    /// Maximum log file size in bytes before rotation (default: 1 GiB).
+    /// When the log file exceeds this size, it is renamed to `<name>.old`
+    /// and a fresh file is created.
+    #[serde(default = "default_log_max_size")]
+    pub max_size: u64,
+}
+
+fn default_log_max_size() -> u64 {
+    1024 * 1024 * 1024 // 1 GiB
 }
 
 fn default_log_format() -> String {
@@ -353,6 +413,7 @@ impl Default for LogConfig {
             format: default_log_format(),
             file: None,
             level: default_log_level(),
+            max_size: default_log_max_size(),
         }
     }
 }
@@ -364,6 +425,7 @@ impl Default for Config {
             host: default_host(),
             providers: HashMap::new(),
             amp: AmpConfig::default(),
+            vertex_ai: VertexAiConfig::default(),
             proxy_url: None,
             model_alias: HashMap::new(),
             excluded_models: HashMap::new(),
