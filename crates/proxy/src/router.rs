@@ -30,6 +30,7 @@ use crate::{AppState, openapi};
 /// - POST /api/provider/openai/v1/chat/completions      `OpenAI`-compatible (`AmpCode`)
 /// - POST /api/provider/openai/v1/responses             Codex Responses API (`AmpCode`)
 /// - POST /api/provider/google/v1beta/models/{action}   Gemini native (`AmpCode`)
+/// - POST /api/provider/google/v1beta1/publishers/google/models/{action}   Gemini via Vertex AI (intercepted in catch-all)
 /// - ANY  /api/{*path}                                  `ampcode.com` management proxy
 pub fn make_router(state: Arc<AppState>) -> Router {
     Router::new()
@@ -68,6 +69,8 @@ pub fn make_router(state: Arc<AppState>) -> Router {
             post(amp_provider::gemini_native_passthrough),
         )
         // Catch-all: forward remaining /api/* routes to ampcode.com
+        // NOTE: Vertex AI path (/api/provider/google/v1beta1/...) is intercepted
+        // inside amp_management_proxy to avoid axum route conflicts.
         .route("/api/{*path}", any(amp_provider::amp_management_proxy))
         // Management API
         .route("/v0/management/status", get(status::status_handler))

@@ -9,6 +9,7 @@
 //! | `POST /api/provider/openai/v1/chat/completions` | [`chat::chat_completions`] (aliased) |
 //! | `POST /api/provider/openai/v1/responses` | [`codex_responses_passthrough`] |
 //! | `POST /api/provider/google/v1beta/models/{action}` | [`gemini_native_passthrough`] |
+//! | `POST /api/provider/google/v1beta1/publishers/google/models/{action}` | intercepted in [`amp_management_proxy`] |
 //!
 //! Management routes (`/api/auth`, `/api/threads`, etc.) are forwarded to
 //! `ampcode.com` verbatim via [`amp_management_proxy`].
@@ -515,6 +516,12 @@ pub async fn gemini_native_passthrough(
 
     // If a backend override is configured, translate and route through it.
     if let Some(backend_id) = &gemini_config.backend {
+        if *backend_id == ProviderId::VertexAi {
+            return gemini_vertex_ai_native(
+                &state, &action, &query_params, body, model_name, &config,
+            )
+            .await;
+        }
         return gemini_native_via_backend(
             &state,
             &action,
@@ -557,6 +564,251 @@ pub async fn gemini_native_passthrough(
         model = %model_name,
         url = %url,
         "gemini native request",
+    );
+
+    let resp = state
+        .http
+        .post(&url)
+        .header(auth_name, auth_value)
+        .header("content-type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| ApiError(ByokError::from(e)))?;
+
+    let provider = "gemini";
+    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        tracing::warn!(
+            status = %status.as_u16(),
+            body = %text,
+            model = %model_name,
+            url = %url,
+            "gemini upstream error",
+        );
+        state.usage.record_failure(model_name, provider);
+        return Err(ApiError::from(ByokError::Upstream {
+            status: status.as_u16(),
+            body: text,
+            retry_after: None,
+        }));
+    }
+
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/json")
+        .to_string();
+
+    if content_type.contains("text/event-stream") {
+        let tapped = tap_gemini_stream_usage(
+            resp,
+            state.usage.clone(),
+            model_name.to_string(),
+            provider.to_string(),
+        );
+        let mapped = tapped.map_err(|e| std::io::Error::other(e.to_string()));
+        Ok(Response::builder()
+            .status(status)
+            .header("content-type", content_type)
+            .header("cache-control", "no-cache")
+            .header("x-accel-buffering", "no")
+            .body(Body::from_stream(mapped))
+            .expect("valid response"))
+    } else {
+        let json: Value = resp
+            .json()
+            .await
+            .map_err(|e| ApiError(ByokError::from(e)))?;
+        let (input, output) = extract_gemini_usage(&json);
+        state
+            .usage
+            .record_success(model_name, provider, input, output);
+        Ok((status, axum::Json(json)).into_response())
+    }
+}
+
+/// Build the Vertex AI host from a region string.
+fn vertex_ai_host(region: &str) -> String {
+    if region == "global" {
+        "aiplatform.googleapis.com".to_owned()
+    } else {
+        format!("{region}-aiplatform.googleapis.com")
+    }
+}
+
+/// Route a Gemini native request through Vertex AI.
+///
+/// Rewrites the URL to the Vertex AI endpoint and authenticates with a GCP
+/// service account token.
+async fn gemini_vertex_ai_native(
+    state: &Arc<AppState>,
+    action: &str,
+    query_params: &HashMap<String, String>,
+    body: Value,
+    model_name: &str,
+    config: &byokey_config::Config,
+) -> Result<Response, ApiError> {
+    let vertex = &config.vertex_ai.gemini;
+    let project_id = vertex.project_id.as_deref().ok_or_else(|| {
+        ApiError::from(ByokError::Config(
+            "vertex_ai.gemini.project_id is required".into(),
+        ))
+    })?;
+
+    let host = vertex_ai_host(&vertex.region);
+    let qs: String = query_params
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("&");
+    let base = format!(
+        "https://{host}/v1beta1/projects/{project_id}/locations/{region}/publishers/google/models/{action}",
+        region = vertex.region,
+    );
+    let url = if qs.is_empty() {
+        base
+    } else {
+        format!("{base}?{qs}")
+    };
+
+    let token = state
+        .gcp_tokens
+        .get_token(vertex.credentials_file.as_deref())
+        .await
+        .map_err(ApiError::from)?;
+
+    tracing::info!(
+        model = %model_name,
+        url = %url,
+        "gemini native request via Vertex AI",
+    );
+
+    let resp = state
+        .http
+        .post(&url)
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| ApiError(ByokError::from(e)))?;
+
+    let provider = "vertex_ai";
+    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        tracing::warn!(
+            status = %status.as_u16(),
+            body = %text,
+            model = %model_name,
+            url = %url,
+            "gemini Vertex AI upstream error",
+        );
+        state.usage.record_failure(model_name, provider);
+        return Err(ApiError::from(ByokError::Upstream {
+            status: status.as_u16(),
+            body: text,
+            retry_after: None,
+        }));
+    }
+
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/json")
+        .to_string();
+
+    if content_type.contains("text/event-stream") {
+        let tapped = tap_gemini_stream_usage(
+            resp,
+            state.usage.clone(),
+            model_name.to_string(),
+            provider.to_string(),
+        );
+        let mapped = tapped.map_err(|e| std::io::Error::other(e.to_string()));
+        Ok(Response::builder()
+            .status(status)
+            .header("content-type", content_type)
+            .header("cache-control", "no-cache")
+            .header("x-accel-buffering", "no")
+            .body(Body::from_stream(mapped))
+            .expect("valid response"))
+    } else {
+        let json: Value = resp
+            .json()
+            .await
+            .map_err(|e| ApiError(ByokError::from(e)))?;
+        let (input, output) = extract_gemini_usage(&json);
+        state
+            .usage
+            .record_success(model_name, provider, input, output);
+        Ok((status, axum::Json(json)).into_response())
+    }
+}
+
+/// Core logic for Vertex AI Gemini passthrough, callable from both the
+/// dedicated route handler and the catch-all `amp_management_proxy`.
+async fn gemini_vertex_ai_passthrough_inner(
+    state: &Arc<AppState>,
+    action: &str,
+    query_params: &HashMap<String, String>,
+    body: Value,
+) -> Result<Response, ApiError> {
+    let config = state.config.load();
+    let gemini_config = config
+        .providers
+        .get(&ProviderId::Gemini)
+        .cloned()
+        .unwrap_or_default();
+
+    let model_name = action
+        .split_once(':')
+        .map_or(action, |(model, _)| model);
+
+    // Vertex AI backend configured → route through Vertex AI.
+    if gemini_config
+        .backend
+        .as_ref()
+        .is_some_and(|b| *b == ProviderId::VertexAi)
+    {
+        return gemini_vertex_ai_native(
+            state, action, query_params, body, model_name, &config,
+        )
+        .await;
+    }
+
+    // No Vertex AI backend — rewrite to the standard Gemini API URL.
+    let api_key = gemini_config.api_key;
+    let qs: String = query_params
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("&");
+    let url = if qs.is_empty() {
+        format!("{GEMINI_MODELS_BASE}/{action}")
+    } else {
+        format!("{GEMINI_MODELS_BASE}/{action}?{qs}")
+    };
+
+    let (auth_name, auth_value): (&'static str, String) = if let Some(key) = api_key {
+        ("x-goog-api-key", key)
+    } else {
+        let token = state
+            .auth
+            .get_token(&ProviderId::Gemini)
+            .await
+            .map_err(ApiError::from)?;
+        ("authorization", format!("Bearer {}", token.access_token))
+    };
+
+    tracing::debug!(
+        model = %model_name,
+        url = %url,
+        "gemini native request (vertex path rewritten)",
     );
 
     let resp = state
@@ -810,6 +1062,37 @@ pub async fn amp_management_proxy(
                     )
                         .into_response();
                 }
+            }
+        }
+    }
+
+    // ── Vertex AI Gemini path interception ────────────────────────────
+    // Intercept `provider/google/v1beta1/publishers/google/models/{action}`
+    // to avoid routing Gemini requests to ampcode.com (which returns 402).
+    // This path cannot be a separate axum route because it conflicts with
+    // the catch-all `/api/{*path}` in axum 0.8.
+    const VERTEX_PREFIX: &str = "provider/google/v1beta1/publishers/google/models/";
+    if let Some(action) = path.strip_prefix(VERTEX_PREFIX) {
+        if !action.is_empty() {
+            let query_params: HashMap<String, String> = query
+                .as_deref()
+                .map(|q| {
+                    q.split('&')
+                        .filter_map(|pair| {
+                            let (k, v) = pair.split_once('=')?;
+                            Some((k.to_string(), v.to_string()))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let body_value: Value = serde_json::from_slice(&body).unwrap_or_default();
+            let action = action.to_string();
+
+            match gemini_vertex_ai_passthrough_inner(&state, &action, &query_params, body_value)
+                .await
+            {
+                Ok(resp) => return resp,
+                Err(e) => return e.into_response(),
             }
         }
     }

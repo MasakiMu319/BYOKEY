@@ -97,7 +97,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
 # TLS
 axum-server = { version = "0.7", features = ["tls-rustls"] }
-rustls = "0.23"
+rustls = { version = "0.23", features = ["ring"] }
 tracing-appender = "0.2"
 # OpenAPI
 utoipa = "5"

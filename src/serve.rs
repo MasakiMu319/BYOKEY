@@ -31,6 +31,10 @@ fn rotate_if_needed(path: &std::path::Path, max_size: u64) {
 }
 
 pub async fn cmd_serve(args: ServerArgs) -> Result<()> {
+    // Install a rustls CryptoProvider so that crates using rustls internally
+    // (e.g. gcp_auth for Vertex AI) can create TLS connections.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let ServerArgs {
         config: config_path,
         port,
