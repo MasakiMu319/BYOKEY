@@ -74,12 +74,20 @@ fn tap_codex_stream_usage(
 
     struct State {
         inner: byokey_types::traits::ByteStream,
+        /// Line-oriented buffer for SSE parsing. Only consumed lines are
+        /// removed; partial lines remain for the next chunk.
         buf: Vec<u8>,
+        /// Reassembled output bytes to forward to the client. Lines are
+        /// copied here verbatim (preserving original framing) so that
+        /// only the `response.completed` data line is replaced.
+        out: Vec<u8>,
         usage: Arc<UsageRecorder>,
         model: String,
         provider: String,
         input_tokens: u64,
         output_tokens: u64,
+        /// Output items collected from `response.output_item.done` events.
+        output_items: Vec<Value>,
     }
 
     let inner: byokey_types::traits::ByteStream =
@@ -89,41 +97,107 @@ fn tap_codex_stream_usage(
         State {
             inner,
             buf: Vec::new(),
+            out: Vec::new(),
             usage,
             model,
             provider,
             input_tokens: 0,
             output_tokens: 0,
+            output_items: Vec::new(),
         },
         |mut s| async move {
             match s.inner.next().await {
                 Some(Ok(bytes)) => {
                     s.buf.extend_from_slice(&bytes);
+                    s.out.clear();
+                    let mut did_patch = false;
+
                     while let Some(nl) = s.buf.iter().position(|&b| b == b'\n') {
-                        let line: Vec<u8> = s.buf.drain(..=nl).collect();
-                        let line = String::from_utf8_lossy(&line);
-                        let line = line.trim();
-                        if let Some(data) = line.strip_prefix("data: ")
-                            && let Ok(ev) = serde_json::from_str::<Value>(data)
-                            && ev.get("type").and_then(Value::as_str) == Some("response.completed")
-                        {
-                            if let Some(v) = ev
-                                .pointer("/response/usage/input_tokens")
-                                .and_then(Value::as_u64)
-                            {
-                                s.input_tokens = v;
-                            }
-                            if let Some(v) = ev
-                                .pointer("/response/usage/output_tokens")
-                                .and_then(Value::as_u64)
-                            {
-                                s.output_tokens = v;
+                        let raw_line: Vec<u8> = s.buf.drain(..=nl).collect();
+                        let trimmed = String::from_utf8_lossy(&raw_line);
+                        let trimmed = trimmed.trim();
+
+                        // Parse `data:` lines for usage tracking and patching.
+                        if let Some(data) = trimmed.strip_prefix("data: ") {
+                            if let Ok(ev) = serde_json::from_str::<Value>(data) {
+                                let event_type = ev
+                                    .get("type")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("unknown");
+                                match event_type {
+                                    "response.output_item.done" => {
+                                        if let Some(item) = ev.get("item").cloned() {
+                                            s.output_items.push(item);
+                                        }
+                                    }
+                                    "response.completed" => {
+                                        if let Some(v) = ev
+                                            .pointer("/response/usage/input_tokens")
+                                            .and_then(Value::as_u64)
+                                        {
+                                            s.input_tokens = v;
+                                        }
+                                        if let Some(v) = ev
+                                            .pointer("/response/usage/output_tokens")
+                                            .and_then(Value::as_u64)
+                                        {
+                                            s.output_tokens = v;
+                                        }
+                                        // Patch empty output array.
+                                        let output_empty = ev
+                                            .pointer("/response/output")
+                                            .and_then(Value::as_array)
+                                            .is_some_and(|a| a.is_empty());
+                                        if output_empty && !s.output_items.is_empty() {
+                                            let mut patched = ev;
+                                            if let Some(resp_obj) = patched
+                                                .get_mut("response")
+                                                .and_then(Value::as_object_mut)
+                                            {
+                                                resp_obj.insert(
+                                                    "output".to_owned(),
+                                                    Value::Array(
+                                                        s.output_items.clone(),
+                                                    ),
+                                                );
+                                            }
+                                            let replacement = format!(
+                                                "data: {}\n",
+                                                serde_json::to_string(&patched)
+                                                    .unwrap_or_default()
+                                            );
+                                            s.out.extend_from_slice(replacement.as_bytes());
+                                            did_patch = true;
+                                            tracing::info!(
+                                                model = %s.model,
+                                                items = s.output_items.len(),
+                                                "patched response.completed output",
+                                            );
+                                            continue;
+                                        }
+                                    }
+                                    _ => {}
+                                }
                             }
                         }
+
+                        // Forward the raw line unchanged.
+                        s.out.extend_from_slice(&raw_line);
                     }
-                    Ok(Some((bytes, s)))
+
+                    let forward = if s.out.is_empty() && !did_patch {
+                        Bytes::new()
+                    } else {
+                        Bytes::from(std::mem::take(&mut s.out))
+                    };
+                    Ok(Some((forward, s)))
                 }
                 Some(Err(e)) => {
+                    tracing::warn!(
+                        error = %e,
+                        model = %s.model,
+                        "codex responses stream error",
+                    );
                     s.usage.record_failure(&s.model, &s.provider);
                     Err(e)
                 }
@@ -214,6 +288,11 @@ fn tap_gemini_stream_usage(
                     Ok(Some((bytes, s)))
                 }
                 Some(Err(e)) => {
+                    tracing::warn!(
+                        error = %e,
+                        model = %s.model,
+                        "gemini stream error",
+                    );
                     s.usage.record_failure(&s.model, &s.provider);
                     Err(e)
                 }
@@ -270,6 +349,28 @@ pub async fn codex_responses_passthrough(
         (true, tok.access_token)
     };
 
+    // The Codex OAuth backend (chatgpt.com) rejects parameters that the
+    // public OpenAI Responses API accepts; strip them to avoid 400 errors.
+    if is_oauth {
+        if let Some(obj) = body.as_object_mut() {
+            obj.remove("max_output_tokens");
+            obj.remove("stream_options");
+        }
+    }
+
+    let upstream_url = if is_oauth {
+        CODEX_RESPONSES_URL
+    } else {
+        OPENAI_RESPONSES_URL
+    };
+
+    tracing::debug!(
+        model = %model_name,
+        url = %upstream_url,
+        oauth = is_oauth,
+        "codex responses request",
+    );
+
     let resp = if is_oauth {
         state
             .http
@@ -293,12 +394,42 @@ pub async fn codex_responses_passthrough(
             .send()
             .await
     }
-    .map_err(|e| ApiError(ByokError::from(e)))?;
+    .map_err(|e| {
+        tracing::warn!(
+            error = %e,
+            model = %model_name,
+            url = %upstream_url,
+            "codex responses transport error",
+        );
+        ApiError(ByokError::from(e))
+    })?;
 
     let provider = "codex";
-    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let upstream_status = resp.status().as_u16();
+    let upstream_ct = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let status = StatusCode::from_u16(upstream_status).unwrap_or(StatusCode::BAD_GATEWAY);
+
+    tracing::debug!(
+        status = upstream_status,
+        content_type = %upstream_ct,
+        model = %model_name,
+        "codex responses upstream response",
+    );
+
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
+        tracing::warn!(
+            status = %status.as_u16(),
+            body = %text,
+            model = %model_name,
+            url = %upstream_url,
+            "codex responses upstream error",
+        );
         state.usage.record_failure(&model_name, provider);
         return Err(ApiError::from(ByokError::Upstream {
             status: status.as_u16(),
@@ -307,11 +438,9 @@ pub async fn codex_responses_passthrough(
         }));
     }
 
-    let is_sse = resp
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|ct| ct.contains("text/event-stream"));
+    // The Codex OAuth backend may omit the content-type header even for SSE
+    // responses; treat OAuth responses as SSE since we always request it.
+    let is_sse = upstream_ct.contains("text/event-stream") || (is_oauth && upstream_ct.is_empty());
 
     if is_sse {
         let tapped =
@@ -325,15 +454,31 @@ pub async fn codex_responses_passthrough(
             .body(Body::from_stream(mapped))
             .expect("valid response"))
     } else {
-        let json: Value = resp
-            .json()
-            .await
-            .map_err(|e| ApiError(ByokError::from(e)))?;
-        let (input, output) = extract_codex_usage(&json);
-        state
-            .usage
-            .record_success(&model_name, provider, input, output);
-        Ok((status, axum::Json(json)).into_response())
+        let text = resp.text().await.unwrap_or_default();
+        match serde_json::from_str::<Value>(&text) {
+            Ok(json) => {
+                let (input, output) = extract_codex_usage(&json);
+                state
+                    .usage
+                    .record_success(&model_name, provider, input, output);
+                Ok((status, axum::Json(json)).into_response())
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    body = %text,
+                    content_type = %upstream_ct,
+                    model = %model_name,
+                    "codex responses body parse error",
+                );
+                state.usage.record_failure(&model_name, provider);
+                Err(ApiError::from(ByokError::Upstream {
+                    status: status.as_u16(),
+                    body: text,
+                    retry_after: None,
+                }))
+            }
+        }
     }
 }
 
@@ -408,6 +553,12 @@ pub async fn gemini_native_passthrough(
         ("authorization", format!("Bearer {}", token.access_token))
     };
 
+    tracing::debug!(
+        model = %model_name,
+        url = %url,
+        "gemini native request",
+    );
+
     let resp = state
         .http
         .post(&url)
@@ -422,6 +573,13 @@ pub async fn gemini_native_passthrough(
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
+        tracing::warn!(
+            status = %status.as_u16(),
+            body = %text,
+            model = %model_name,
+            url = %url,
+            "gemini upstream error",
+        );
         state.usage.record_failure(model_name, provider);
         return Err(ApiError::from(ByokError::Upstream {
             status: status.as_u16(),
